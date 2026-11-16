@@ -3,6 +3,7 @@ from typing import Literal, Self
 
 from pydantic import (
     EmailStr,
+    Field,
     HttpUrl,
     PostgresDsn,
     computed_field,
@@ -55,6 +56,11 @@ class Settings(BaseSettings):
         return self
 
     EMAIL_RESET_TOKEN_EXPIRE_HOURS: int = 48
+
+    # Login lockout: lock an account after this many consecutive failed logins
+    LOGIN_MAX_FAILED_ATTEMPTS: int = Field(default=5, ge=1)
+    # ...for this many minutes
+    LOGIN_LOCKOUT_MINUTES: int = Field(default=15, ge=1)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

@@ -94,6 +94,8 @@ def reset_password(session: SessionDep, body: NewPassword) -> Message:
         db_user=user,
         user_in=user_in_update,
     )
+    # A successful password reset clears any login lockout.
+    crud.clear_login_lockout(session=session, user_id=user.id)
     return Message(message="Password updated successfully")
 
 

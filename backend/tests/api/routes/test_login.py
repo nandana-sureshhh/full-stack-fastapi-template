@@ -1,3 +1,4 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -7,7 +8,7 @@ from sqlmodel import Session
 from app.core.config import settings
 from app.core.security import get_password_hash, verify_password
 from app.crud import create_user
-from app.models import User, UserCreate
+from app.models import User, UserCreate, get_datetime_utc
 from app.utils import generate_password_reset_token
 from tests.utils.user import user_authentication_headers
 from tests.utils.utils import random_email, random_lower_string
@@ -189,3 +190,100 @@ def test_login_with_argon2_password_keeps_hash(client: TestClient, db: Session) 
 
     assert user.hashed_password == original_hash
     assert user.hashed_password.startswith("$argon2")
+
+
+LOGIN_URL = f"{settings.API_V1_STR}/login/access-token"
+GENERIC_ERROR = {"detail": "Incorrect email or password"}
+
+
+def _create_user(db: Session, *, is_active: bool = True) -> tuple[User, str]:
+    password = random_lower_string()
+    user = create_user(
+        session=db,
+        user_create=UserCreate(
+            email=random_email(), password=password, is_active=is_active
+        ),
+    )
+    return user, password
+
+
+def _login(client: TestClient, email: str, password: str):  # type: ignore[no-untyped-def]
+    return client.post(LOGIN_URL, data={"username": email, "password": password})
+
+
+def test_login_lockout_after_failed_attempts(client: TestClient, db: Session) -> None:
+    user, password = _create_user(db)
+    with patch("app.core.config.settings.LOGIN_MAX_FAILED_ATTEMPTS", 3):
+        for _ in range(3):
+            r = _login(client, user.email, "wrong-password")
+            assert r.status_code == 400
+            assert r.json() == GENERIC_ERROR
+        # Locked: even the correct password gets the generic error
+        r = _login(client, user.email, password)
+        assert r.status_code == 400
+        assert r.json() == GENERIC_ERROR
+
+
+def test_locked_response_matches_unknown_email_and_wrong_password(
+    client: TestClient, db: Session
+) -> None:
+    user, password = _create_user(db)
+    with patch("app.core.config.settings.LOGIN_MAX_FAILED_ATTEMPTS", 1):
+        wrong = _login(client, user.email, "wrong-password")  # triggers the lock
+        locked = _login(client, user.email, password)
+    unknown = _login(client, random_email(), "wrong-password")
+    assert wrong.status_code == locked.status_code == unknown.status_code == 400
+    assert wrong.json() == locked.json() == unknown.json() == GENERIC_ERROR
+
+
+def test_successful_login_resets_failure_count(client: TestClient, db: Session) -> None:
+    user, password = _create_user(db)
+    with patch("app.core.config.settings.LOGIN_MAX_FAILED_ATTEMPTS", 5):
+        for _ in range(4):
+            assert _login(client, user.email, "bad").status_code == 400
+        assert _login(client, user.email, password).status_code == 200
+        for _ in range(4):
+            assert _login(client, user.email, "bad").status_code == 400
+        # Still not locked: only 4 failures since the reset
+        assert _login(client, user.email, password).status_code == 200
+
+
+def test_login_works_after_lock_expires(client: TestClient, db: Session) -> None:
+    user, password = _create_user(db)
+    user.locked_until = get_datetime_utc() + timedelta(minutes=5)
+    db.add(user)
+    db.commit()
+    assert _login(client, user.email, password).status_code == 400
+    user.locked_until = get_datetime_utc() - timedelta(minutes=1)
+    db.add(user)
+    db.commit()
+    assert _login(client, user.email, password).status_code == 200
+
+
+def test_reset_password_clears_lockout(client: TestClient, db: Session) -> None:
+    user, password = _create_user(db)
+    new_password = random_lower_string()
+    with patch("app.core.config.settings.LOGIN_MAX_FAILED_ATTEMPTS", 1):
+        assert _login(client, user.email, "bad").status_code == 400
+        assert _login(client, user.email, password).status_code == 400  # locked
+    token = generate_password_reset_token(email=user.email)
+    r = client.post(
+        f"{settings.API_V1_STR}/reset-password/",
+        json={"new_password": new_password, "token": token},
+    )
+    assert r.status_code == 200
+    db.refresh(user)
+    assert user.locked_until is None
+    assert user.failed_login_attempts == 0
+    assert _login(client, user.email, new_password).status_code == 200
+
+
+def test_locked_inactive_user_gets_generic_error(
+    client: TestClient, db: Session
+) -> None:
+    user, password = _create_user(db, is_active=False)
+    with patch("app.core.config.settings.LOGIN_MAX_FAILED_ATTEMPTS", 1):
+        assert _login(client, user.email, "bad").json() == GENERIC_ERROR
+        r = _login(client, user.email, password)
+    assert r.status_code == 400
+    assert r.json() == GENERIC_ERROR
